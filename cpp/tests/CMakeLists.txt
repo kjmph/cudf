@@ -175,6 +175,7 @@ ConfigureTest(
   join/conditional_join_tests.cu
   join/cross_join_tests.cpp
   join/semi_anti_join_tests.cpp
+  join/mixed_filtered_join_tests.cu
   join/mixed_join_tests.cu
   join/direct_join_tests.cpp
   join/distinct_join_tests.cpp

@@ -880,6 +880,7 @@ add_library(
   src/join/join_utils.cu
   src/join/key_remapping.cu
   src/join/mark_join.cu
+  src/join/mixed_filtered_join.cu
   src/join/mixed_join.cu
   src/join/mixed_join_kernels_semi.cu
   src/join/mixed_join_semi.cu
