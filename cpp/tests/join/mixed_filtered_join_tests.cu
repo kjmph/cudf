@@ -14,6 +14,8 @@
 #include <cudf/join/mixed_join.hpp>
 #include <cudf/table/table_view.hpp>
 
+#include <rmm/mr/statistics_resource_adaptor.hpp>
+
 #include <algorithm>
 #include <limits>
 #include <vector>
@@ -369,6 +371,29 @@ TEST_F(MixedFilteredJoinTest, ConcurrentProbesShareBuildIndex)
   expect_indices(second, {0}, parent_stream);
 }
 
+TEST_F(MixedFilteredJoinTest, PersistentMemoryResourceAndLoadFactor)
+{
+  cudf::test::fixed_width_column_wrapper<int32_t> build_key{1, 1, 2};
+  cudf::test::fixed_width_column_wrapper<int32_t> build_value{10, 30, 25};
+  auto const build_equality    = cudf::table_view{{build_key}};
+  auto const build_conditional = cudf::table_view{{build_value}};
+  auto mr   = rmm::mr::statistics_resource_adaptor(cudf::get_current_device_resource_ref());
+  auto join = cudf::mixed_filtered_join{
+    build_equality, cudf::null_equality::UNEQUAL, 0.75, cudf::get_default_stream(), mr};
+
+  EXPECT_GT(mr.get_bytes_counter().peak, 0);
+
+  cudf::test::fixed_width_column_wrapper<int32_t> probe_key{1, 2};
+  cudf::test::fixed_width_column_wrapper<int32_t> probe_value{20, 20};
+  auto const left_value  = cudf::ast::column_reference(0, cudf::ast::table_reference::LEFT);
+  auto const right_value = cudf::ast::column_reference(0, cudf::ast::table_reference::RIGHT);
+  auto const less = cudf::ast::operation(cudf::ast::ast_operator::LESS, left_value, right_value);
+  expect_indices(
+    join.semi_join(
+      cudf::table_view{{probe_key}}, cudf::table_view{{probe_value}}, build_conditional, less),
+    {0, 1});
+}
+
 TEST_F(MixedFilteredJoinTest, ValidatesTableShapesAndPredicateType)
 {
   cudf::test::fixed_width_column_wrapper<int32_t> build_key{1, 2};
@@ -386,6 +411,10 @@ TEST_F(MixedFilteredJoinTest, ValidatesTableShapesAndPredicateType)
 
   EXPECT_THROW((void)cudf::mixed_filtered_join(cudf::table_view{}, cudf::null_equality::UNEQUAL),
                cudf::logic_error);
+  EXPECT_THROW((void)cudf::mixed_filtered_join(build_equality, cudf::null_equality::UNEQUAL, 0.0),
+               std::invalid_argument);
+  EXPECT_THROW((void)cudf::mixed_filtered_join(build_equality, cudf::null_equality::UNEQUAL, 1.01),
+               std::invalid_argument);
   EXPECT_THROW(
     (void)join.semi_join(
       probe_equality, cudf::table_view{{short_probe_value}}, build_conditional, non_boolean),
@@ -409,6 +438,45 @@ TEST_F(MixedFilteredJoinTest, ValidatesTableShapesAndPredicateType)
     (void)join.semi_join(
       cudf::table_view{{wrong_type_probe_key}}, build_conditional, build_conditional, equal),
     cudf::data_type_error);
+}
+
+TEST_F(MixedFilteredJoinTest, ValidatesArgumentsBeforeEmptyInputFastPaths)
+{
+  cudf::test::fixed_width_column_wrapper<int32_t> empty_key{};
+  cudf::test::fixed_width_column_wrapper<int32_t> empty_value{};
+  auto const empty_equality    = cudf::table_view{{empty_key}};
+  auto const empty_conditional = cudf::table_view{{empty_value}};
+  auto empty_build_join = cudf::mixed_filtered_join{empty_equality, cudf::null_equality::UNEQUAL};
+  EXPECT_THROW((void)cudf::mixed_filtered_join(empty_equality, cudf::null_equality::UNEQUAL, 0.0),
+               std::invalid_argument);
+
+  cudf::test::fixed_width_column_wrapper<int32_t> probe_key{1};
+  cudf::test::fixed_width_column_wrapper<int64_t> wrong_type_probe_key{1};
+  cudf::test::fixed_width_column_wrapper<int32_t> probe_value{10};
+  auto const non_boolean = cudf::ast::column_reference(0, cudf::ast::table_reference::LEFT);
+
+  // An empty build determines the result, but must not suppress equality-schema or predicate
+  // validation.
+  EXPECT_THROW((void)empty_build_join.semi_join(cudf::table_view{{wrong_type_probe_key}},
+                                                cudf::table_view{{probe_value}},
+                                                empty_conditional,
+                                                non_boolean),
+               cudf::data_type_error);
+  EXPECT_THROW((void)empty_build_join.anti_join(cudf::table_view{{probe_key}},
+                                                cudf::table_view{{probe_value}},
+                                                empty_conditional,
+                                                non_boolean),
+               cudf::data_type_error);
+
+  cudf::test::fixed_width_column_wrapper<int32_t> build_key{1};
+  cudf::test::fixed_width_column_wrapper<int32_t> build_value{10};
+  auto nonempty_build_join =
+    cudf::mixed_filtered_join{cudf::table_view{{build_key}}, cudf::null_equality::UNEQUAL};
+
+  // Likewise, an empty probe must not suppress predicate validation.
+  EXPECT_THROW((void)nonempty_build_join.semi_join(
+                 empty_equality, empty_conditional, cudf::table_view{{build_value}}, non_boolean),
+               cudf::data_type_error);
 }
 
 }  // namespace

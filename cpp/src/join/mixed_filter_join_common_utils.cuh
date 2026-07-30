@@ -75,15 +75,26 @@ struct double_row_equality_comparator {
 // A CUDA Cooperative Group of 1 thread for the hash set for mixed semi.
 auto constexpr DEFAULT_MIXED_SEMI_JOIN_CG_SIZE = 1;
 
-// The hash set type used by mixed_semi_join with the build_table.
-using hash_set_type =
+/**
+ * @brief Hash set type used by mixed semi joins.
+ *
+ * The key equality used while building the set is a template parameter because different
+ * mixed-semi implementations have different duplicate handling requirements. The one-shot join
+ * can discard rows that are identical in both its equality and conditional tables. A reusable
+ * join, whose conditional table is supplied only when probing, must retain every build row.
+ */
+template <typename KeyEqual>
+using mixed_semi_hash_set_type =
   cuco::static_set<size_type,
                    cuco::extent<size_t>,
                    cuda::thread_scope_device,
-                   double_row_equality_comparator,
+                   KeyEqual,
                    cuco::linear_probing<DEFAULT_MIXED_SEMI_JOIN_CG_SIZE, row_hash>,
                    rmm::mr::polymorphic_allocator<char>,
                    cuco::storage<1>>;
+
+// The hash set type used by mixed_semi_join with the build_table.
+using hash_set_type = mixed_semi_hash_set_type<double_row_equality_comparator>;
 
 // The hash_set_ref_type used by mixed_semi_join kernels for probing.
 using hash_set_ref_type = hash_set_type::ref_type<cuco::contains_tag>;

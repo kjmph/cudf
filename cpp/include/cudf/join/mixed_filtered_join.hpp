@@ -63,10 +63,33 @@ class mixed_filtered_join {
    * @param build_equality The right table containing equality join columns
    * @param compare_nulls Whether null equality-key values compare equal
    * @param stream CUDA stream used to construct the equality index
+   * @param mr Device memory resource used to allocate the equality index
    */
   mixed_filtered_join(table_view const& build_equality,
                       null_equality compare_nulls  = null_equality::EQUAL,
-                      rmm::cuda_stream_view stream = cudf::get_default_stream());
+                      rmm::cuda_stream_view stream = cudf::get_default_stream(),
+                      cuda::mr::any_resource<cuda::mr::device_accessible> mr =
+                        cudf::get_current_device_resource_ref());
+
+  /**
+   * @brief Constructs a reusable mixed join from a right-side equality table.
+   *
+   * @throw cudf::logic_error If `build_equality` has no columns.
+   * @throw std::invalid_argument If `load_factor` is not in the range (0, 1].
+   *
+   * @param build_equality The right table containing equality join columns
+   * @param compare_nulls Whether null equality-key values compare equal
+   * @param load_factor The desired ratio of filled slots to total slots in the equality index,
+   * must be in the range (0, 1]
+   * @param stream CUDA stream used to construct the equality index
+   * @param mr Device memory resource used to allocate the equality index
+   */
+  mixed_filtered_join(table_view const& build_equality,
+                      null_equality compare_nulls,
+                      double load_factor,
+                      rmm::cuda_stream_view stream = cudf::get_default_stream(),
+                      cuda::mr::any_resource<cuda::mr::device_accessible> mr =
+                        cudf::get_current_device_resource_ref());
 
   /**
    * @brief Returns left row indices having at least one right row for which equality and the
