@@ -20,10 +20,13 @@
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/type_checks.hpp>
 
+#include <rmm/cuda_stream.hpp>
+
 #include <cuda/devices>
 #include <cuda/iterator>
 #include <thrust/iterator/transform_iterator.h>
 
+#include <future>
 #include <numeric>
 
 using cudf::test::fixed_width_column_wrapper;
@@ -562,6 +565,54 @@ TEST_F(HashPartition, StructofStructWithNulls)
   // Expect same result for the hashed columns
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(first_result->get_column(0).view(),
                                  second_result->get_column(0).view());
+}
+
+TEST_F(HashPartition, ConcurrentLargeHashPartitionsOnDistinctStreams)
+{
+  // Match the scale of a Velox partitioned-output batch that failed when two drivers invoked
+  // hash_partition concurrently on separate streams.
+  constexpr cudf::size_type num_rows       = 10'000'000;
+  constexpr cudf::size_type num_partitions = 52;
+
+  auto const first =
+    cudf::sequence(num_rows, cudf::numeric_scalar<int64_t>{0}, cudf::numeric_scalar<int64_t>{1});
+  auto const second =
+    cudf::sequence(num_rows, cudf::numeric_scalar<int64_t>{7}, cudf::numeric_scalar<int64_t>{3});
+  auto const payload =
+    cudf::sequence(num_rows, cudf::numeric_scalar<int64_t>{11}, cudf::numeric_scalar<int64_t>{5});
+  auto const input = cudf::table_view{{first->view(), second->view(), payload->view()}};
+  cudf::get_default_stream().synchronize();
+
+  int device;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+  std::promise<void> start_promise;
+  auto const start         = start_promise.get_future().share();
+  auto const run_partition = [device, input, start] {
+    CUDF_CUDA_TRY(cudaSetDevice(device));
+    rmm::cuda_stream stream;
+    start.wait();
+
+    auto [output, offsets] = cudf::hash_partition(input,
+                                                  std::vector<cudf::size_type>{0, 1},
+                                                  num_partitions,
+                                                  cudf::hash_id::HASH_MURMUR3,
+                                                  cudf::DEFAULT_HASH_SEED,
+                                                  stream);
+    return std::pair{output->num_rows(), std::move(offsets)};
+  };
+
+  auto first_partition  = std::async(std::launch::async, run_partition);
+  auto second_partition = std::async(std::launch::async, run_partition);
+  start_promise.set_value();
+
+  for (auto* result : {&first_partition, &second_partition}) {
+    auto [output_rows, offsets] = result->get();
+    EXPECT_EQ(output_rows, num_rows);
+    ASSERT_EQ(offsets.size(), static_cast<std::size_t>(num_partitions + 1));
+    EXPECT_EQ(offsets.front(), 0);
+    EXPECT_EQ(offsets.back(), num_rows);
+    EXPECT_TRUE(std::is_sorted(offsets.begin(), offsets.end()));
+  }
 }
 
 CUDF_TEST_PROGRAM_MAIN()

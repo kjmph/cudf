@@ -15,9 +15,11 @@
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/hashing/detail/murmurhash3_x86_32.cuh>
+#include <cudf/logger.hpp>
 #include <cudf/partitioning.hpp>
 #include <cudf/table/table_device_view.cuh>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -32,7 +34,10 @@
 #include <thrust/scan.h>
 #include <thrust/transform.h>
 
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 
 namespace cudf {
 namespace {
@@ -45,6 +50,68 @@ constexpr size_type THRESHOLD_FOR_OPTIMIZED_PARTITION_KERNEL = 1024;
 // Launch configuration for fallback hash partition
 constexpr size_type FALLBACK_BLOCK_SIZE      = 256;
 constexpr size_type FALLBACK_ROWS_PER_THREAD = 1;
+
+enum class hash_partition_diagnostic_mode { OFF, LOG, SYNC };
+
+/**
+ * @brief Returns the diagnostic mode selected by `CUDF_HASH_PARTITION_DIAGNOSTICS`.
+ *
+ * The accepted values are `log` and `sync`. Any other non-empty, non-zero value enables logging.
+ * `sync` additionally synchronizes between the major hash-partition stages so an asynchronous CUDA
+ * error can be attributed to the stage that produced it. The environment variable is read once
+ * because it is process-wide configuration.
+ */
+hash_partition_diagnostic_mode get_hash_partition_diagnostic_mode()
+{
+  static auto const mode = [] {
+    auto const* value = std::getenv("CUDF_HASH_PARTITION_DIAGNOSTICS");
+    if (value == nullptr) { return hash_partition_diagnostic_mode::OFF; }
+
+    auto const setting = std::string_view{value};
+    if (setting.empty() || setting == "0" || setting == "off") {
+      return hash_partition_diagnostic_mode::OFF;
+    }
+    return setting == "sync" ? hash_partition_diagnostic_mode::SYNC
+                             : hash_partition_diagnostic_mode::LOG;
+  }();
+  return mode;
+}
+
+void synchronize_hash_partition_diagnostic_stage(hash_partition_diagnostic_mode mode,
+                                                 char const* stage,
+                                                 int device,
+                                                 size_type num_rows,
+                                                 size_type num_partitions,
+                                                 rmm::cuda_stream_view stream)
+{
+  if (mode != hash_partition_diagnostic_mode::SYNC) { return; }
+
+  auto const status = cudaStreamSynchronize(stream.value());
+  if (status != cudaSuccess) {
+    CUDF_LOG_WARN(
+      "CUDF_HASH_PARTITION_DIAGNOSTIC event=sync_error stage=%s device=%d stream=%p rows=%d "
+      "partitions=%d cuda_error=%s cuda_message=%s",
+      stage,
+      device,
+      reinterpret_cast<void*>(stream.value()),
+      num_rows,
+      num_partitions,
+      cudaGetErrorName(status),
+      cudaGetErrorString(status));
+    throw cuda_error{std::string{"hash_partition diagnostic synchronization failed at stage="} +
+                       stage + ": " + cudaGetErrorString(status),
+                     status};
+  }
+
+  CUDF_LOG_WARN(
+    "CUDF_HASH_PARTITION_DIAGNOSTIC event=sync_complete stage=%s device=%d stream=%p rows=%d "
+    "partitions=%d",
+    stage,
+    device,
+    reinterpret_cast<void*>(stream.value()),
+    num_rows,
+    num_partitions);
+}
 
 /**
  * @brief  Functor to map a hash value to a particular 'bin' or partition number
@@ -576,18 +643,36 @@ std::pair<std::unique_ptr<table>, std::vector<size_type>> hash_partition_table(
 {
   auto const num_rows = table_to_hash.num_rows();
 
+  auto const diagnostic_mode = get_hash_partition_diagnostic_mode();
+  int dev;
+  CUDF_CUDA_TRY(cudaGetDevice(&dev));
+  synchronize_hash_partition_diagnostic_stage(
+    diagnostic_mode, "entry", dev, num_rows, num_partitions, stream);
+
   auto const row_hasher = detail::row::hash::row_hasher(table_to_hash, stream);
   auto const hasher =
     row_hasher.device_hasher<hash_function>(nullate::DYNAMIC{hash_has_nulls}, seed);
 
   // Check whether the per-block shared memory histograms fit in shared memory
-  int dev;
-  CUDF_CUDA_TRY(cudaGetDevice(&dev));
   auto const fits_in_shared_memory =
     static_cast<std::size_t>(num_partitions) <
     cuda::device_attributes::max_shared_memory_per_block(cuda::device_ref{dev}) / sizeof(size_type);
+  auto const* cuda_launch_blocking = std::getenv("CUDA_LAUNCH_BLOCKING");
 
   if (!fits_in_shared_memory) {
+    if (diagnostic_mode != hash_partition_diagnostic_mode::OFF) {
+      CUDF_LOG_WARN(
+        "CUDF_HASH_PARTITION_DIAGNOSTIC event=begin mode=%s path=global device=%d stream=%p "
+        "rows=%d input_columns=%d key_columns=%d partitions=%d cuda_launch_blocking=%s",
+        diagnostic_mode == hash_partition_diagnostic_mode::SYNC ? "sync" : "log",
+        dev,
+        reinterpret_cast<void*>(stream.value()),
+        num_rows,
+        input.num_columns(),
+        table_to_hash.num_columns(),
+        num_partitions,
+        cuda_launch_blocking == nullptr ? "<unset>" : cuda_launch_blocking);
+    }
     return hash_partition_table_global_memory(input, num_rows, num_partitions, hasher, stream, mr);
   }
 
@@ -598,6 +683,27 @@ std::pair<std::unique_ptr<table>, std::vector<size_type>> hash_partition_table(
   auto const rows_per_block = block_size * rows_per_thread;
 
   std::size_t const grid_size = util::div_rounding_up_safe(num_rows, rows_per_block);
+
+  if (diagnostic_mode != hash_partition_diagnostic_mode::OFF) {
+    CUDF_LOG_WARN(
+      "CUDF_HASH_PARTITION_DIAGNOSTIC event=begin mode=%s path=shared device=%d stream=%p rows=%d "
+      "input_columns=%d key_columns=%d partitions=%d block_size=%d rows_per_thread=%d blocks=%zu "
+      "block_scan_items=%zu global_scan_items=%d dynamic_shared_bytes=%zu cuda_launch_blocking=%s",
+      diagnostic_mode == hash_partition_diagnostic_mode::SYNC ? "sync" : "log",
+      dev,
+      reinterpret_cast<void*>(stream.value()),
+      num_rows,
+      input.num_columns(),
+      table_to_hash.num_columns(),
+      num_partitions,
+      block_size,
+      rows_per_thread,
+      grid_size,
+      grid_size * num_partitions,
+      num_partitions,
+      static_cast<std::size_t>(num_partitions) * sizeof(size_type),
+      cuda_launch_blocking == nullptr ? "<unset>" : cuda_launch_blocking);
+  }
 
   // Allocate array to hold which partition each row belongs to
   auto row_partition_numbers = rmm::device_uvector<size_type>(num_rows, stream);
@@ -666,20 +772,57 @@ std::pair<std::unique_ptr<table>, std::vector<size_type>> hash_partition_table(
     CUDF_CUDA_TRY(cudaGetLastError());
   }
 
+  synchronize_hash_partition_diagnostic_stage(
+    diagnostic_mode, "row_partition_kernel", dev, num_rows, num_partitions, stream);
+
   // Compute exclusive scan of all blocks' partition sizes in-place to determine
   // the starting point for each blocks portion of each partition in the output
-  thrust::exclusive_scan(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-                         block_partition_sizes.begin(),
-                         block_partition_sizes.end(),
-                         scanned_block_partition_sizes.data());
+  try {
+    thrust::exclusive_scan(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                           block_partition_sizes.begin(),
+                           block_partition_sizes.end(),
+                           scanned_block_partition_sizes.data());
+  } catch (std::exception const& error) {
+    if (diagnostic_mode != hash_partition_diagnostic_mode::OFF) {
+      CUDF_LOG_WARN(
+        "CUDF_HASH_PARTITION_DIAGNOSTIC event=exception stage=block_partition_scan device=%d "
+        "stream=%p rows=%d partitions=%d items=%zu message=%s",
+        dev,
+        reinterpret_cast<void*>(stream.value()),
+        num_rows,
+        num_partitions,
+        grid_size * num_partitions,
+        error.what());
+    }
+    throw;
+  }
+  synchronize_hash_partition_diagnostic_stage(
+    diagnostic_mode, "block_partition_scan", dev, num_rows, num_partitions, stream);
 
   // Compute exclusive scan of size of each partition to determine offset
   // location of each partition in final output.
   // TODO This can be done independently on a separate stream
-  thrust::exclusive_scan(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-                         global_partition_sizes.begin(),
-                         global_partition_sizes.end(),
-                         global_partition_sizes.begin());
+  try {
+    thrust::exclusive_scan(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                           global_partition_sizes.begin(),
+                           global_partition_sizes.end(),
+                           global_partition_sizes.begin());
+  } catch (std::exception const& error) {
+    if (diagnostic_mode != hash_partition_diagnostic_mode::OFF) {
+      CUDF_LOG_WARN(
+        "CUDF_HASH_PARTITION_DIAGNOSTIC event=exception stage=global_partition_scan device=%d "
+        "stream=%p rows=%d partitions=%d items=%d message=%s",
+        dev,
+        reinterpret_cast<void*>(stream.value()),
+        num_rows,
+        num_partitions,
+        num_partitions,
+        error.what());
+    }
+    throw;
+  }
+  synchronize_hash_partition_diagnostic_stage(
+    diagnostic_mode, "global_partition_scan", dev, num_rows, num_partitions, stream);
 
   // Copy the result of the exclusive scan to the output offsets array
   // to indicate the starting point for each partition in the output
