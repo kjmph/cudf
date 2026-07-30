@@ -215,6 +215,7 @@ ConfigureTest(
   partitioning/hash_partition_scan_test.cu
   partitioning/round_robin_test.cpp
   partitioning/partition_test.cpp
+  EXTRA_LIBS rmm::rmm
   GPUS 1
   PERCENT 70
 )
