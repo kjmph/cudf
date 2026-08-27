@@ -118,6 +118,14 @@ using cudf::io::text::byte_range_info;
  * @param stream CUDA stream
  * @param mr Device memory resource
  *
+ * The caller must keep `datasource` and the returned device buffers alive until the returned future
+ * has been consumed. The future must be consumed before the returned spans are used or their
+ * destination buffers are destroyed. If an issued read fails, consuming the future drains every
+ * issued read before rethrowing the first completion exception in issue order. If scheduling a read
+ * throws synchronously, that scheduling exception remains primary after all previously issued reads
+ * are drained. This relies on the datasource completion contract for both returned futures and
+ * synchronous scheduling failures.
+ *
  * @return A tuple containing the device buffers, the device spans of the fetched data, and a future
  * to wait on the read tasks
  */
@@ -138,6 +146,14 @@ fetch_byte_ranges_to_device_async(cudf::io::datasource& datasource,
  * @param byte_ranges_per_source Vector of byte ranges to fetch, one per datasource
  * @param stream CUDA stream
  * @param mr Device memory resource
+ *
+ * The caller must keep every datasource and the returned device buffers alive until the returned
+ * future has been consumed. The future must be consumed before the returned spans are used or their
+ * destination buffers are destroyed. If an issued read fails, consuming the future drains every
+ * issued read before rethrowing the first completion exception in issue order. If scheduling a read
+ * throws synchronously, that scheduling exception remains primary after all previously issued reads
+ * are drained. This relies on each datasource's completion contract for both returned futures and
+ * synchronous scheduling failures.
  *
  * @return A tuple containing a vector of device buffers, a vector of vectors of device spans (one
  * per byte range per datasource), and a future to wait on the read tasks

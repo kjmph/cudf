@@ -9,6 +9,7 @@
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/io/config_utils.hpp>
 #include <cudf/io/datasource.hpp>
+#include <cudf/io/detail/async_device_io.hpp>
 #include <cudf/logger.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/span.hpp>
@@ -23,6 +24,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <exception>
+#include <memory>
 #include <regex>
 #include <vector>
 
@@ -227,8 +230,30 @@ class device_buffer_source final : public datasource {
                                         rmm::cuda_stream_view stream) override
   {
     auto const count = std::min(size, this->size() - offset);
-    CUDF_CUDA_TRY(cudf::detail::memcpy_async(dst, _d_buffer.data() + offset, count, stream));
-    return std::async(std::launch::deferred, [count] { return count; });
+    int device;
+    CUDF_CUDA_TRY(cudf::io::detail::get_stream_device(stream, &device));
+
+    auto completion_event = std::make_shared<cudf::io::detail::stream_completion_event>(device);
+    auto completion       = std::async(std::launch::deferred, [completion_event, count] {
+      completion_event->synchronize();
+      return count;
+    });
+
+    try {
+      auto const device_scope = cudf::io::detail::impl::scoped_cuda_device{device};
+      CUDF_CUDA_TRY(cudf::detail::memcpy_async(dst, _d_buffer.data() + offset, count, stream));
+      completion_event->record(stream);
+    } catch (...) {
+      auto const primary_exception = std::current_exception();
+      try {
+        cudf::io::detail::synchronize_stream(stream, device);
+      } catch (...) {
+        // The enqueue error remains primary. synchronize_stream has already established completion.
+      }
+      std::rethrow_exception(primary_exception);
+    }
+
+    return completion;
   }
 
   size_t device_read(size_t offset,

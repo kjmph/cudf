@@ -5,6 +5,7 @@
 
 #include "io/comp/common.hpp"
 #include "io/parquet/parquet_common.hpp"
+#include "io/utilities/future_drain_guard.hpp"
 
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
@@ -12,6 +13,7 @@
 #include <cudf/detail/utilities/host_worker_pool.hpp>
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/io/datasource.hpp>
+#include <cudf/io/detail/async_device_io.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/io/parquet_schema.hpp>
@@ -26,8 +28,10 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <exception>
 #include <format>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
@@ -72,17 +76,14 @@ auto dispatch_fetch_tasks(std::size_t num_sources, Task fetch_task)
                   [&](std::size_t source_idx) { results.emplace_back(fetch_task(source_idx)); });
   } else {
     // Dispatch the tasks to the host worker pool
-    std::vector<std::future<result_type>> tasks;
-    tasks.reserve(num_sources);
+    cudf::io::detail::future_drain_guard<result_type> tasks{num_sources};
     std::for_each(cuda::counting_iterator<std::size_t>(0),
                   cuda::counting_iterator<std::size_t>(num_sources),
                   [&](std::size_t source_idx) {
-                    tasks.emplace_back(cudf::detail::host_worker_pool().submit_task(
+                    tasks.push(cudf::detail::host_worker_pool().submit_task(
                       [&fetch_task, source_idx]() { return fetch_task(source_idx); }));
                   });
-    std::transform(tasks.begin(), tasks.end(), std::back_inserter(results), [](auto& task) {
-      return task.get();
-    });
+    tasks.consume_all([&results](result_type result) { results.emplace_back(std::move(result)); });
   }
   return results;
 }
@@ -179,6 +180,56 @@ std::vector<std::unique_ptr<cudf::io::datasource::buffer>> fetch_page_indexes_to
   return dispatch_fetch_tasks(datasources.size(), [&](std::size_t source_idx) {
     return fetch_page_index(datasources[source_idx].get(), page_index_bytes_per_source[source_idx]);
   });
+}
+
+using host_read_buffer = std::unique_ptr<cudf::io::datasource::buffer>;
+
+/**
+ * @brief Drains device reads and establishes host-to-device copy completion before rethrowing.
+ *
+ * A datasource future is required to stop accessing its destination before it becomes ready, even
+ * exceptionally. A failed CUDA stream fence is followed by a device-wide fence. If that last-resort
+ * fence also fails, returning would make it possible to destroy storage while DMA is still in
+ * flight, so the process is terminated. The original enqueue or synchronization exception remains
+ * primary whenever recovery is possible.
+ */
+[[noreturn]] void finish_failed_host_copy(
+  std::exception_ptr primary_exception,
+  bool stream_fence_required,
+  rmm::cuda_stream_view stream,
+  int device,
+  cudf::io::detail::future_drain_guard<size_t>& device_read_tasks)
+{
+  try {
+    device_read_tasks.wait_all();
+  } catch (...) {
+    // The enqueue or stream error remains primary. The datasource completion contract guarantees
+    // that an exceptional ready future has nevertheless stopped accessing its destination.
+  }
+
+  if (stream_fence_required) {
+    try {
+      cudf::io::detail::synchronize_stream(stream, device);
+    } catch (...) {
+      // The enqueue error remains primary. synchronize_stream established completion.
+    }
+  }
+
+  std::rethrow_exception(primary_exception);
+}
+
+[[noreturn]] void finish_failed_device_schedule(
+  std::exception_ptr primary_exception,
+  cudf::io::detail::future_drain_guard<size_t>& device_read_tasks)
+{
+  try {
+    device_read_tasks.wait_all();
+  } catch (...) {
+    // The synchronous scheduling error remains primary. The datasource completion contract
+    // guarantees that an exceptional ready future has stopped accessing its destination.
+  }
+
+  std::rethrow_exception(primary_exception);
 }
 
 using device_spans_per_source_type = std::vector<cudf::device_span<uint8_t const>>;
@@ -279,13 +330,26 @@ fetch_byte_ranges_to_device_async_impl(
                  io_source_indices.size() == io_offsets.size(),
                "Unexpected number of IO source indices, offsets, sizes, or destinations");
 
-  using host_read_buffer = std::unique_ptr<cudf::io::datasource::buffer>;
+  // Guards to drain every issued read before its source or destination can unwind.
+  auto device_read_tasks =
+    std::make_shared<cudf::io::detail::future_drain_guard<size_t>>(io_offsets.size());
+  auto expected_device_read_sizes = std::make_shared<std::vector<size_t>>();
+  expected_device_read_sizes->reserve(io_offsets.size());
+  cudf::io::detail::future_drain_guard<host_read_buffer> host_read_tasks{io_offsets.size()};
+  int device;
+  CUDF_CUDA_TRY(cudf::io::detail::get_stream_device(stream, &device));
 
-  // Vectors to hold futures from datasource
-  std::vector<std::future<size_t>> device_read_tasks{};
-  std::vector<std::future<host_read_buffer>> host_read_tasks{};
-  device_read_tasks.reserve(io_offsets.size());
-  host_read_tasks.reserve(io_offsets.size());
+  // Construct the returned completion state before any device read is issued. A failure to allocate
+  // that state therefore cannot strand an issued read. The shared guard also drains reads if the
+  // returned deferred future is discarded without being consumed.
+  auto read_completion =
+    std::async(std::launch::deferred, [device_read_tasks, expected_device_read_sizes] {
+      device_read_tasks->consume_all_indexed(
+        [&expected_device_read_sizes](std::size_t task_index, std::size_t bytes_read) {
+          CUDF_EXPECTS(bytes_read == (*expected_device_read_sizes)[task_index],
+                       "Unexpected discrepancy in bytes read.");
+        });
+    });
 
   // Vectors to store intermediate host buffers and relevant pointers
   std::vector<host_read_buffer> host_buffers{};
@@ -312,7 +376,7 @@ fetch_byte_ranges_to_device_async_impl(
       auto& datasource = datasources[src_idx].get();
       if (not datasource.is_device_read_preferred(io_size)) {
         // Asynchronously read column chunk data to a host buffer
-        host_read_tasks.emplace_back(cudf::detail::host_worker_pool().submit_task(
+        host_read_tasks.push(cudf::detail::host_worker_pool().submit_task(
           [&datasource, io_offset, io_size]() -> host_read_buffer {
             return datasource.host_read(io_offset, io_size);
           }));
@@ -327,52 +391,75 @@ fetch_byte_ranges_to_device_async_impl(
     copy_srcs.reserve(host_read_tasks.size());
     host_buffers.reserve(host_read_tasks.size());
 
-    for (auto& task : host_read_tasks) {
-      host_buffers.emplace_back(task.get());
+    host_read_tasks.consume_all_indexed([&](std::size_t task_index, host_read_buffer host_buffer) {
+      CUDF_EXPECTS(host_buffer != nullptr, "Datasource returned a null host buffer.");
+      CUDF_EXPECTS(host_buffer->size() == copy_sizes[task_index],
+                   "Unexpected discrepancy in bytes read.");
+      host_buffers.emplace_back(std::move(host_buffer));
       copy_srcs.push_back(host_buffers.back().get()->data());
-    }
+    });
   }
 
   // `device_read_async` is not guaranteed to follow stream-ordering (see datasource API docs)
-  stream.synchronize();
+  cudf::io::detail::synchronize_stream(stream, device);
 
-  // Schedule device reads holding the `device_read_mutex` so that all reads for a caller thread
-  // are scheduled without interleaving with reads from other threads yielding better pipelining
+  std::exception_ptr device_schedule_error;
+  std::exception_ptr host_copy_enqueue_error;
+  // Schedule device reads holding the `device_read_mutex` so that all reads
+  // for a caller thread are scheduled without interleaving with reads from
+  // other threads, yielding better pipelining.
   {
     std::scoped_lock<std::mutex> lock(device_read_mutex);
 
-    std::for_each(iter, iter + io_offsets.size(), [&](auto const& tuple) {
-      auto const src_idx   = cuda::std::get<0>(tuple);
-      auto const io_offset = cuda::std::get<1>(tuple);
-      auto const io_size   = cuda::std::get<2>(tuple);
-      auto const dest      = cuda::std::get<3>(tuple);
+    try {
+      std::for_each(iter, iter + io_offsets.size(), [&](auto const& tuple) {
+        auto const src_idx   = cuda::std::get<0>(tuple);
+        auto const io_offset = cuda::std::get<1>(tuple);
+        auto const io_size   = cuda::std::get<2>(tuple);
+        auto const dest      = cuda::std::get<3>(tuple);
 
-      auto& datasource = datasources[src_idx].get();
-      // Directly read the column chunk data to the device buffer if supported
-      if (datasource.is_device_read_preferred(io_size)) {
-        device_read_tasks.emplace_back(
-          datasource.device_read_async(io_offset, io_size, dest, stream));
-      }
-    });
+        auto& datasource = datasources[src_idx].get();
+        // Directly read the column chunk data to the device buffer if supported
+        if (datasource.is_device_read_preferred(io_size)) {
+          expected_device_read_sizes->push_back(io_size);
+          device_read_tasks->push(datasource.device_read_async(io_offset, io_size, dest, stream));
+        }
+      });
+    } catch (...) {
+      device_schedule_error = std::current_exception();
+    }
 
     // Schedule a batched memcpy from host buffers to device
-    if (not host_buffers.empty()) {
-      CUDF_CUDA_TRY(cudf::detail::memcpy_batch_async(
-        copy_dsts.data(), copy_srcs.data(), copy_sizes.data(), copy_dsts.size(), stream));
+    if (device_schedule_error == nullptr and not host_buffers.empty()) {
+      try {
+        CUDF_CUDA_TRY(cudf::detail::memcpy_batch_async(
+          copy_dsts.data(), copy_srcs.data(), copy_sizes.data(), copy_dsts.size(), stream));
+      } catch (...) {
+        host_copy_enqueue_error = std::current_exception();
+      }
     }
   }
 
-  // Synchronize stream if `memcpy_batch_async` was called to safely discard the host buffers
-  if (not host_buffers.empty()) { stream.synchronize(); }
+  if (device_schedule_error != nullptr) {
+    finish_failed_device_schedule(device_schedule_error, *device_read_tasks);
+  }
 
-  auto sync_function = [](decltype(device_read_tasks) device_read_tasks) {
-    for (auto& task : device_read_tasks) {
-      task.get();
+  if (host_copy_enqueue_error != nullptr) {
+    finish_failed_host_copy(host_copy_enqueue_error, true, stream, device, *device_read_tasks);
+  }
+
+  // Synchronize stream if `memcpy_batch_async` was called to safely discard the host buffers
+  if (not host_buffers.empty()) {
+    try {
+      cudf::io::detail::synchronize_stream(stream, device);
+    } catch (...) {
+      finish_failed_host_copy(std::current_exception(), false, stream, device, *device_read_tasks);
     }
-  };
+  }
+
   return {std::move(column_chunk_buffers),
           std::move(column_chunk_data_per_source),
-          std::async(std::launch::deferred, sync_function, std::move(device_read_tasks))};
+          std::move(read_completion)};
 }
 
 }  // namespace

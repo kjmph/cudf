@@ -12,6 +12,7 @@
 
 #include <cudf/column/column.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/io/datasource.hpp>
 #include <cudf/io/experimental/hybrid_scan.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_io_utils.hpp>
@@ -20,13 +21,29 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/aligned.hpp>
+#include <rmm/cuda_stream.hpp>
+#include <rmm/device_buffer.hpp>
 #include <rmm/mr/aligned_resource_adaptor.hpp>
 
 #include <cuda/iterator>
+#include <cuda_runtime_api.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <future>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -234,10 +251,474 @@ std::unique_ptr<cudf::table> test_hybrid_scan_column_selection(
   return read_single_step;
 }
 
+class controlled_device_read_datasource : public cudf::io::datasource {
+ public:
+  enum class behavior {
+    first_wait_fails_then_pending,
+    first_pending_then_second_schedule_fails,
+    first_pending_then_second_ready,
+    first_short_then_pending,
+    host_reads_short,
+    first_host_read_fails_then_pending
+  };
+
+  static constexpr auto wait_failure_message     = "first device read wait failed";
+  static constexpr auto schedule_failure_message = "second device read scheduling failed";
+
+  explicit controlled_device_read_datasource(behavior read_behavior) : read_behavior_{read_behavior}
+  {
+  }
+
+  std::unique_ptr<cudf::io::datasource::buffer> host_read(std::size_t offset,
+                                                          std::size_t size) override
+  {
+    if (read_behavior_ == behavior::first_host_read_fails_then_pending) {
+      auto const call = host_calls_.fetch_add(1, std::memory_order_relaxed);
+      if (call == 0) { throw std::runtime_error(wait_failure_message); }
+      if (call == 1) {
+        pending_wait_started_.set_value();
+        pending_release_future_.wait();
+      } else {
+        throw std::logic_error("unexpected host read call");
+      }
+    }
+    auto read_size = clamped_size(offset, size);
+    if (read_behavior_ == behavior::host_reads_short and read_size != 0) { --read_size; }
+    auto bytes = std::vector<std::byte>(read_size);
+    return cudf::io::datasource::buffer::create(std::move(bytes));
+  }
+
+  std::size_t host_read(std::size_t offset, std::size_t size, uint8_t* dst) override
+  {
+    auto const read_size = clamped_size(offset, size);
+    auto const returned_size =
+      read_behavior_ == behavior::host_reads_short and read_size != 0 ? read_size - 1 : read_size;
+    std::fill_n(dst, returned_size, uint8_t{0});
+    return returned_size;
+  }
+
+  [[nodiscard]] bool supports_device_read() const override
+  {
+    return read_behavior_ != behavior::host_reads_short and
+           read_behavior_ != behavior::first_host_read_fails_then_pending;
+  }
+
+  std::future<std::size_t> device_read_async(std::size_t,
+                                             std::size_t size,
+                                             uint8_t*,
+                                             rmm::cuda_stream_view) override
+  {
+    auto const call = calls_.fetch_add(1, std::memory_order_relaxed);
+
+    switch (read_behavior_) {
+      case behavior::first_wait_fails_then_pending:
+        if (call == 0) {
+          return std::async(std::launch::deferred, []() -> std::size_t {
+            throw std::runtime_error(wait_failure_message);
+          });
+        }
+        if (call == 1) { return make_pending_read(size); }
+        break;
+      case behavior::first_pending_then_second_schedule_fails:
+        if (call == 0) { return make_pending_read(size); }
+        if (call == 1) { throw std::runtime_error(schedule_failure_message); }
+        break;
+      case behavior::first_pending_then_second_ready:
+        if (call == 0) { return make_pending_read(size); }
+        if (call == 1) {
+          std::promise<std::size_t> result;
+          result.set_value(size);
+          return result.get_future();
+        }
+        break;
+      case behavior::first_short_then_pending:
+        if (call == 0) {
+          std::promise<std::size_t> result;
+          result.set_value(size == 0 ? 0 : size - 1);
+          return result.get_future();
+        }
+        if (call == 1) { return make_pending_read(size); }
+        break;
+      case behavior::host_reads_short:
+      case behavior::first_host_read_fails_then_pending: break;
+    }
+
+    throw std::logic_error("unexpected device read call");
+  }
+
+  [[nodiscard]] std::size_t size() const override { return source_size; }
+
+  [[nodiscard]] std::size_t calls() const noexcept
+  {
+    return calls_.load(std::memory_order_relaxed);
+  }
+
+  [[nodiscard]] std::future_status wait_for_pending_read(std::chrono::seconds timeout)
+  {
+    return pending_wait_started_future_.wait_for(timeout);
+  }
+
+  void release_pending_read() { pending_release_.set_value(); }
+
+ private:
+  [[nodiscard]] static std::size_t clamped_size(std::size_t offset, std::size_t size)
+  {
+    return offset >= source_size ? 0 : std::min(size, source_size - offset);
+  }
+
+  std::future<std::size_t> make_pending_read(std::size_t size)
+  {
+    return std::async(std::launch::deferred, [this, size] {
+      pending_wait_started_.set_value();
+      pending_release_future_.wait();
+      return size;
+    });
+  }
+
+  static constexpr std::size_t source_size = 16;
+
+  behavior read_behavior_;
+  std::atomic<std::size_t> calls_{0};
+  std::atomic<std::size_t> host_calls_{0};
+  std::promise<void> pending_wait_started_;
+  std::future<void> pending_wait_started_future_{pending_wait_started_.get_future()};
+  std::promise<void> pending_release_;
+  std::shared_future<void> pending_release_future_{pending_release_.get_future().share()};
+};
+
+template <typename Callable>
+std::string exception_message(Callable&& callable)
+{
+  try {
+    std::invoke(std::forward<Callable>(callable));
+  } catch (std::exception const& error) {
+    return error.what();
+  } catch (...) {
+    return "non-standard exception";
+  }
+  return {};
+}
+
+auto two_noncontiguous_ranges()
+{
+  return std::array<cudf::io::text::byte_range_info, 2>{cudf::io::text::byte_range_info{0, 4},
+                                                        cudf::io::text::byte_range_info{8, 4}};
+}
+
+struct stream_callback_gate {
+  std::promise<void> entered;
+  std::future<void> entered_future{entered.get_future()};
+  std::promise<void> release;
+  std::shared_future<void> release_future{release.get_future().share()};
+};
+
+void CUDART_CB hold_stream_until_released(void* opaque_gate) noexcept
+{
+  auto& gate = *static_cast<stream_callback_gate*>(opaque_gate);
+  gate.entered.set_value();
+  gate.release_future.wait();
+}
+
 }  // namespace
 
 // Base test fixture for tests
 struct HybridScanTest : public cudf::test::BaseFixture {};
+
+TEST_F(HybridScanTest, DeviceBufferSourceCompletionSynchronizesCopyStream)
+{
+  constexpr std::size_t read_size = 16;
+  rmm::cuda_stream stream;
+  rmm::device_buffer source_buffer{read_size, stream};
+  rmm::device_buffer destination_buffer{read_size, stream};
+  auto datasource = cudf::io::datasource::create(cudf::device_span<std::byte const>{
+    static_cast<std::byte const*>(source_buffer.data()), source_buffer.size()});
+  stream_callback_gate gate;
+
+  ASSERT_EQ(cudaLaunchHostFunc(stream.value(), hold_stream_until_released, &gate), cudaSuccess);
+  auto completion = datasource->device_read_async(
+    0, read_size, static_cast<uint8_t*>(destination_buffer.data()), stream);
+  auto waiter = std::async(std::launch::async, [completion = std::move(completion)]() mutable {
+    return completion.get();
+  });
+
+  auto constexpr gate_timeout = std::chrono::seconds{10};
+  if (gate.entered_future.wait_for(gate_timeout) != std::future_status::ready) {
+    gate.release.set_value();
+    std::ignore = waiter.get();
+    FAIL() << "stream callback did not start";
+  }
+
+  EXPECT_EQ(waiter.wait_for(std::chrono::seconds{0}), std::future_status::timeout);
+  gate.release.set_value();
+  EXPECT_EQ(waiter.get(), read_size);
+}
+
+TEST_F(HybridScanTest, DeviceBufferSourceDiscardedCompletionSynchronizesCopyStream)
+{
+  constexpr std::size_t read_size = 16;
+  rmm::cuda_stream stream;
+  rmm::device_buffer source_buffer{read_size, stream};
+  rmm::device_buffer destination_buffer{read_size, stream};
+  auto datasource = cudf::io::datasource::create(cudf::device_span<std::byte const>{
+    static_cast<std::byte const*>(source_buffer.data()), source_buffer.size()});
+  stream_callback_gate gate;
+  std::promise<void> discard_started;
+  auto discard_started_future = discard_started.get_future();
+
+  ASSERT_EQ(cudaLaunchHostFunc(stream.value(), hold_stream_until_released, &gate), cudaSuccess);
+  auto completion = datasource->device_read_async(
+    0, read_size, static_cast<uint8_t*>(destination_buffer.data()), stream);
+  auto discard = std::async(std::launch::async,
+                            [completion = std::move(completion), &discard_started]() mutable {
+                              discard_started.set_value();
+                              completion = std::future<std::size_t>{};
+                            });
+
+  auto constexpr gate_timeout = std::chrono::seconds{10};
+  if (discard_started_future.wait_for(gate_timeout) != std::future_status::ready or
+      gate.entered_future.wait_for(gate_timeout) != std::future_status::ready) {
+    gate.release.set_value();
+    discard.get();
+    FAIL() << "completion discard or stream callback did not start";
+  }
+
+  EXPECT_EQ(discard.wait_for(std::chrono::seconds{0}), std::future_status::timeout);
+  gate.release.set_value();
+  EXPECT_NO_THROW(discard.get());
+}
+
+TEST_F(HybridScanTest, DeviceBufferSourceCompletionPreservesPerThreadStreamIdentity)
+{
+  constexpr std::size_t read_size = 16;
+  auto const stream               = rmm::cuda_stream_per_thread;
+  rmm::cuda_stream allocation_stream;
+  rmm::device_buffer source_buffer{read_size, allocation_stream};
+  rmm::device_buffer destination_buffer{read_size, allocation_stream};
+  allocation_stream.synchronize();
+  auto datasource = cudf::io::datasource::create(cudf::device_span<std::byte const>{
+    static_cast<std::byte const*>(source_buffer.data()), source_buffer.size()});
+  stream_callback_gate gate;
+  int device;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+
+  std::promise<std::future<std::size_t>> completion_promise;
+  auto completion_future = completion_promise.get_future();
+  std::promise<void> producer_release;
+  auto producer_release_future = producer_release.get_future().share();
+  auto producer                = std::async(std::launch::async, [&] {
+    try {
+      CUDF_CUDA_TRY(cudaSetDevice(device));
+      CUDF_CUDA_TRY(cudaLaunchHostFunc(stream.value(), hold_stream_until_released, &gate));
+      auto completion = datasource->device_read_async(
+        0, read_size, static_cast<uint8_t*>(destination_buffer.data()), stream);
+      completion_promise.set_value(std::move(completion));
+      producer_release_future.wait();
+    } catch (...) {
+      completion_promise.set_exception(std::current_exception());
+      throw;
+    }
+  });
+
+  std::future<std::size_t> completion;
+  try {
+    completion = completion_future.get();
+  } catch (...) {
+    gate.release.set_value();
+    producer_release.set_value();
+    std::ignore = exception_message([&producer] { producer.get(); });
+    throw;
+  }
+  auto waiter = std::async(std::launch::async, [completion = std::move(completion)]() mutable {
+    return completion.get();
+  });
+
+  auto constexpr gate_timeout = std::chrono::seconds{10};
+  if (gate.entered_future.wait_for(gate_timeout) != std::future_status::ready) {
+    gate.release.set_value();
+    producer_release.set_value();
+    std::ignore = waiter.get();
+    std::ignore = exception_message([&producer] { producer.get(); });
+    FAIL() << "per-thread stream callback did not start";
+  }
+
+  EXPECT_EQ(waiter.wait_for(std::chrono::seconds{0}), std::future_status::timeout);
+  gate.release.set_value();
+  EXPECT_EQ(waiter.get(), read_size);
+  producer_release.set_value();
+  EXPECT_NO_THROW(producer.get());
+}
+
+TEST_F(HybridScanTest, DeviceReadWaitFailureDrainsPendingReads)
+{
+  controlled_device_read_datasource datasource{
+    controlled_device_read_datasource::behavior::first_wait_fails_then_pending};
+  auto const byte_ranges = two_noncontiguous_ranges();
+  auto const byte_range_span =
+    cudf::host_span<cudf::io::text::byte_range_info const>{byte_ranges.data(), byte_ranges.size()};
+
+  auto [buffers, spans, completion] =
+    cudf::io::parquet::fetch_byte_ranges_to_device_async(datasource,
+                                                         byte_range_span,
+                                                         cudf::get_default_stream(),
+                                                         cudf::get_current_device_resource_ref());
+  EXPECT_EQ(datasource.calls(), 2);
+
+  auto waiter = std::async(std::launch::async, [completion = std::move(completion)]() mutable {
+    return exception_message([&completion] { completion.get(); });
+  });
+
+  auto constexpr gate_timeout = std::chrono::seconds{10};
+  if (datasource.wait_for_pending_read(gate_timeout) != std::future_status::ready) {
+    datasource.release_pending_read();
+    auto const error = waiter.get();
+    FAIL() << "completion did not drain the second device read; observed error: " << error;
+  }
+
+  EXPECT_EQ(waiter.wait_for(std::chrono::seconds{0}), std::future_status::timeout);
+  datasource.release_pending_read();
+  EXPECT_EQ(waiter.get(), controlled_device_read_datasource::wait_failure_message);
+}
+
+TEST_F(HybridScanTest, DeviceReadScheduleFailureDrainsPreviouslyIssuedReads)
+{
+  controlled_device_read_datasource datasource{
+    controlled_device_read_datasource::behavior::first_pending_then_second_schedule_fails};
+  auto const byte_ranges = two_noncontiguous_ranges();
+  auto const byte_range_span =
+    cudf::host_span<cudf::io::text::byte_range_info const>{byte_ranges.data(), byte_ranges.size()};
+
+  auto invocation = std::async(std::launch::async, [&datasource, byte_range_span] {
+    return exception_message([&] {
+      std::ignore = cudf::io::parquet::fetch_byte_ranges_to_device_async(
+        datasource,
+        byte_range_span,
+        cudf::get_default_stream(),
+        cudf::get_current_device_resource_ref());
+    });
+  });
+
+  auto constexpr gate_timeout = std::chrono::seconds{10};
+  if (datasource.wait_for_pending_read(gate_timeout) != std::future_status::ready) {
+    datasource.release_pending_read();
+    auto const error = invocation.get();
+    FAIL() << "scheduling failure did not drain the first device read; observed error: " << error;
+  }
+
+  EXPECT_EQ(invocation.wait_for(std::chrono::seconds{0}), std::future_status::timeout);
+  datasource.release_pending_read();
+  EXPECT_EQ(invocation.get(), controlled_device_read_datasource::schedule_failure_message);
+  EXPECT_EQ(datasource.calls(), 2);
+}
+
+TEST_F(HybridScanTest, DiscardedCompletionFutureDrainsPendingReads)
+{
+  controlled_device_read_datasource datasource{
+    controlled_device_read_datasource::behavior::first_pending_then_second_ready};
+  auto const byte_ranges = two_noncontiguous_ranges();
+  auto const byte_range_span =
+    cudf::host_span<cudf::io::text::byte_range_info const>{byte_ranges.data(), byte_ranges.size()};
+
+  auto [buffers, spans, completion] =
+    cudf::io::parquet::fetch_byte_ranges_to_device_async(datasource,
+                                                         byte_range_span,
+                                                         cudf::get_default_stream(),
+                                                         cudf::get_current_device_resource_ref());
+  EXPECT_EQ(datasource.calls(), 2);
+
+  auto discard = std::async(std::launch::async, [completion = std::move(completion)]() mutable {
+    completion = std::future<void>{};
+  });
+
+  auto constexpr gate_timeout = std::chrono::seconds{10};
+  if (datasource.wait_for_pending_read(gate_timeout) != std::future_status::ready) {
+    datasource.release_pending_read();
+    discard.get();
+    FAIL() << "discarding the completion future did not drain the pending device read";
+  }
+
+  EXPECT_EQ(discard.wait_for(std::chrono::seconds{0}), std::future_status::timeout);
+  datasource.release_pending_read();
+  EXPECT_NO_THROW(discard.get());
+}
+
+TEST_F(HybridScanTest, ShortDeviceReadDrainsPendingReadsBeforeFailure)
+{
+  controlled_device_read_datasource datasource{
+    controlled_device_read_datasource::behavior::first_short_then_pending};
+  auto const byte_ranges = two_noncontiguous_ranges();
+  auto const byte_range_span =
+    cudf::host_span<cudf::io::text::byte_range_info const>{byte_ranges.data(), byte_ranges.size()};
+
+  auto [buffers, spans, completion] =
+    cudf::io::parquet::fetch_byte_ranges_to_device_async(datasource,
+                                                         byte_range_span,
+                                                         cudf::get_default_stream(),
+                                                         cudf::get_current_device_resource_ref());
+  auto waiter = std::async(std::launch::async, [completion = std::move(completion)]() mutable {
+    return exception_message([&completion] { completion.get(); });
+  });
+
+  auto constexpr gate_timeout = std::chrono::seconds{10};
+  if (datasource.wait_for_pending_read(gate_timeout) != std::future_status::ready) {
+    datasource.release_pending_read();
+    auto const error = waiter.get();
+    FAIL() << "short-read failure did not drain the second device read; observed error: " << error;
+  }
+
+  EXPECT_EQ(waiter.wait_for(std::chrono::seconds{0}), std::future_status::timeout);
+  datasource.release_pending_read();
+  EXPECT_NE(waiter.get().find("Unexpected discrepancy in bytes read"), std::string::npos);
+}
+
+TEST_F(HybridScanTest, ShortHostReadFailsBeforeDeviceCopy)
+{
+  controlled_device_read_datasource datasource{
+    controlled_device_read_datasource::behavior::host_reads_short};
+  auto const byte_ranges = two_noncontiguous_ranges();
+  auto const byte_range_span =
+    cudf::host_span<cudf::io::text::byte_range_info const>{byte_ranges.data(), byte_ranges.size()};
+
+  auto const error = exception_message([&] {
+    std::ignore =
+      cudf::io::parquet::fetch_byte_ranges_to_device_async(datasource,
+                                                           byte_range_span,
+                                                           cudf::get_default_stream(),
+                                                           cudf::get_current_device_resource_ref());
+  });
+
+  EXPECT_NE(error.find("Unexpected discrepancy in bytes read"), std::string::npos);
+  EXPECT_EQ(datasource.calls(), 0);
+}
+
+TEST_F(HybridScanTest, HostReadFailureDrainsPendingSibling)
+{
+  controlled_device_read_datasource datasource{
+    controlled_device_read_datasource::behavior::first_host_read_fails_then_pending};
+  auto const byte_ranges = two_noncontiguous_ranges();
+  auto const byte_range_span =
+    cudf::host_span<cudf::io::text::byte_range_info const>{byte_ranges.data(), byte_ranges.size()};
+
+  auto invocation = std::async(std::launch::async, [&datasource, byte_range_span] {
+    return exception_message([&] {
+      std::ignore = cudf::io::parquet::fetch_byte_ranges_to_device_async(
+        datasource,
+        byte_range_span,
+        cudf::get_default_stream(),
+        cudf::get_current_device_resource_ref());
+    });
+  });
+
+  auto constexpr gate_timeout = std::chrono::seconds{10};
+  if (datasource.wait_for_pending_read(gate_timeout) != std::future_status::ready) {
+    datasource.release_pending_read();
+    auto const error = invocation.get();
+    FAIL() << "host-read failure did not drain its pending sibling; observed error: " << error;
+  }
+
+  EXPECT_EQ(invocation.wait_for(std::chrono::seconds{0}), std::future_status::timeout);
+  datasource.release_pending_read();
+  EXPECT_EQ(invocation.get(), controlled_device_read_datasource::wait_failure_message);
+}
 
 TEST_F(HybridScanTest, FilterRowGroupsOnlyAndScanSelectColumns)
 {
