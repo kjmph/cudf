@@ -5,6 +5,7 @@
 
 #include "compact_protocol_reader.hpp"
 #include "expression_transform_helpers.hpp"
+#include "io/utilities/future_drain_guard.hpp"
 #include "io/utilities/time_utils.hpp"
 #include "reader_impl_helpers.hpp"
 #include "timestamp_utils.cuh"
@@ -14,6 +15,7 @@
 #include <cudf/detail/cuco_helpers.hpp>
 #include <cudf/detail/transform.hpp>
 #include <cudf/hashing/detail/xxhash_64.cuh>
+#include <cudf/io/detail/async_device_io.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/logger.hpp>
 #include <cudf/reduction/bloom_filter.cuh>
@@ -29,9 +31,10 @@
 #include <cuda/iterator>
 #include <thrust/tabulate.h>
 
-#include <future>
+#include <exception>
 #include <numeric>
 #include <optional>
+#include <vector>
 
 namespace cudf::io::parquet::detail {
 namespace {
@@ -321,100 +324,119 @@ void read_bloom_filter_data(host_span<std::unique_ptr<datasource> const> sources
                                    policy_type>::filter_block_type);
   auto constexpr words_per_block = policy_type::words_per_block;
 
-  // Read tasks for bloom filter data
-  std::vector<std::future<std::size_t>> read_tasks;
+  // Device futures and pageable host buffers may continue accessing the
+  // destination asynchronously. Keep both alive until all reads and copies
+  // have reached a completion fence.
+  cudf::io::detail::future_drain_guard<std::size_t> read_tasks{num_chunks};
+  std::vector<std::size_t> expected_read_sizes;
+  expected_read_sizes.reserve(num_chunks);
+  std::vector<std::unique_ptr<datasource::buffer>> host_copy_sources;
+  host_copy_sources.reserve(num_chunks);
+  int device;
+  CUDF_CUDA_TRY(cudf::io::detail::get_stream_device(stream, &device));
 
-  // Read bloom filters for all column chunks
-  std::for_each(
-    cuda::counting_iterator<std::size_t>{0},
-    cuda::counting_iterator{num_chunks},
-    [&](auto const chunk) {
-      // If bloom filter offset absent, fill in an empty buffer and skip ahead
-      if (not bloom_filter_offsets[chunk].has_value()) {
-        bloom_filter_data[chunk] = {};
-        return;
-      }
-      // Read bloom filter iff present
-      auto const bloom_filter_offset = bloom_filter_offsets[chunk].value();
+  try {
+    // Read bloom filters for all column chunks.
+    std::for_each(
+      cuda::counting_iterator<std::size_t>{0},
+      cuda::counting_iterator{num_chunks},
+      [&](auto const chunk) {
+        // If bloom filter offset absent, fill in an empty buffer and skip ahead.
+        if (not bloom_filter_offsets[chunk].has_value()) {
+          bloom_filter_data[chunk] = {};
+          return;
+        }
+        auto const bloom_filter_offset = bloom_filter_offsets[chunk].value();
 
-      // If Bloom filter size (header + bitset) is available, just read the entire thing.
-      // Else just read 256 bytes which will contain the entire header and may contain the
-      // entire bitset as well.
-      auto constexpr bloom_filter_size_guess = 256;
-      auto const initial_read_size =
-        static_cast<std::size_t>(bloom_filter_sizes[chunk].value_or(bloom_filter_size_guess));
+        // If Bloom filter size (header + bitset) is available, read the entire
+        // thing. Otherwise, read enough bytes to contain the header and perhaps
+        // the complete bitset.
+        auto constexpr bloom_filter_size_guess = 256;
+        auto const initial_read_size =
+          static_cast<std::size_t>(bloom_filter_sizes[chunk].value_or(bloom_filter_size_guess));
 
-      // Read an initial buffer from source
-      auto& source = sources[chunk_source_map[chunk]];
-      auto buffer  = source->host_read(bloom_filter_offset, initial_read_size);
+        auto& source = sources[chunk_source_map[chunk]];
+        auto buffer  = source->host_read(bloom_filter_offset, initial_read_size);
+        CUDF_EXPECTS(buffer != nullptr, "Datasource returned a null bloom filter buffer.");
 
-      // Deserialize the Bloom filter header from the buffer.
-      BloomFilterHeader header;
-      CompactProtocolReader cp{buffer->data(), buffer->size()};
-      cp.read(&header);
+        BloomFilterHeader header;
+        CompactProtocolReader cp{buffer->data(), buffer->size()};
+        cp.read(&header);
 
-      // Check if the bloom filter header is valid.
-      auto const is_header_valid =
-        (header.num_bytes % words_per_block) == 0 and
-        header.compression.compression == BloomFilterCompression::UNCOMPRESSED and
-        header.algorithm.algorithm == BloomFilterAlgorithm::SPLIT_BLOCK and
-        header.hash.hash == BloomFilterHash::XXHASH;
+        auto const is_header_valid =
+          (header.num_bytes % words_per_block) == 0 and
+          header.compression.compression == BloomFilterCompression::UNCOMPRESSED and
+          header.algorithm.algorithm == BloomFilterAlgorithm::SPLIT_BLOCK and
+          header.hash.hash == BloomFilterHash::XXHASH;
+        if (not is_header_valid) {
+          bloom_filter_data[chunk] = {};
+          CUDF_LOG_WARN("Encountered an invalid bloom filter header. Skipping");
+          return;
+        }
 
-      // Do not read if the bloom filter is invalid
-      if (not is_header_valid) {
-        bloom_filter_data[chunk] = {};
-        CUDF_LOG_WARN("Encountered an invalid bloom filter header. Skipping");
-        return;
-      }
+        auto const bloom_filter_header_size = static_cast<std::size_t>(cp.bytecount());
+        auto const bitset_size              = static_cast<std::size_t>(header.num_bytes);
 
-      // Bloom filter header size
-      auto const bloom_filter_header_size = static_cast<int64_t>(cp.bytecount());
-      auto const bitset_size              = static_cast<std::size_t>(header.num_bytes);
+        // Use the bytes actually returned, rather than the requested size: a
+        // datasource may clamp the speculative read at end-of-file.
+        if (buffer->size() >= bloom_filter_header_size and
+            bitset_size <= buffer->size() - bloom_filter_header_size) {
+          host_copy_sources.emplace_back(std::move(buffer));
+          auto const& copy_source  = host_copy_sources.back();
+          bloom_filter_data[chunk] = rmm::device_buffer{
+            copy_source->data() + bloom_filter_header_size, bitset_size, stream, aligned_mr};
+        } else {
+          auto const bitset_offset = bloom_filter_offset + bloom_filter_header_size;
+          if (source->is_device_read_preferred(bitset_size)) {
+            bloom_filter_data[chunk] = rmm::device_buffer{bitset_size, stream, aligned_mr};
+            // Reserve before scheduling so recording the expected size cannot
+            // allocate after a future has begun using this destination.
+            expected_read_sizes.push_back(bitset_size);
+            read_tasks.push(
+              source->device_read_async(bitset_offset,
+                                        bitset_size,
+                                        static_cast<uint8_t*>(bloom_filter_data[chunk].data()),
+                                        stream));
+          } else {
+            buffer = source->host_read(bitset_offset, bitset_size);
+            CUDF_EXPECTS(buffer != nullptr, "Datasource returned a null bloom filter buffer.");
+            CUDF_EXPECTS(buffer->size() == bitset_size,
+                         "Unexpected discrepancy in bloom filter bytes read.");
+            host_copy_sources.emplace_back(std::move(buffer));
+            auto const& copy_source = host_copy_sources.back();
+            bloom_filter_data[chunk] =
+              rmm::device_buffer{copy_source->data(), copy_source->size(), stream, aligned_mr};
+          }
+        }
 
-      // Check if we already read in the filter bitset in the initial read.
-      if (initial_read_size >= bloom_filter_header_size + bitset_size) {
-        bloom_filter_data[chunk] = rmm::device_buffer{
-          buffer->data() + bloom_filter_header_size, bitset_size, stream, aligned_mr};
-        // The allocated bloom filter buffer must be aligned
         CUDF_EXPECTS(reinterpret_cast<std::uintptr_t>(bloom_filter_data[chunk].data()) %
                          filter_block_alignment ==
                        0,
                      "Encountered misaligned bloom filter block");
-      }
-      // Read the bitset from datasource.
-      else {
-        auto const bitset_offset = bloom_filter_offset + bloom_filter_header_size;
-        // Directly read to device if preferred
-        if (source->is_device_read_preferred(bitset_size)) {
-          bloom_filter_data[chunk] = rmm::device_buffer{bitset_size, stream, aligned_mr};
-          // The allocated bloom filter buffer must be aligned
-          CUDF_EXPECTS(reinterpret_cast<std::uintptr_t>(bloom_filter_data[chunk].data()) %
-                           filter_block_alignment ==
-                         0,
-                       "Encountered misaligned bloom filter block");
-          auto future_read_size =
-            source->device_read_async(bitset_offset,
-                                      bitset_size,
-                                      static_cast<uint8_t*>(bloom_filter_data[chunk].data()),
-                                      stream);
+      });
 
-          read_tasks.emplace_back(std::move(future_read_size));
-        } else {
-          buffer = source->host_read(bitset_offset, bitset_size);
-          bloom_filter_data[chunk] =
-            rmm::device_buffer{buffer->data(), buffer->size(), stream, aligned_mr};
-          // The allocated bloom filter buffer must be aligned
-          CUDF_EXPECTS(reinterpret_cast<std::uintptr_t>(bloom_filter_data[chunk].data()) %
-                           filter_block_alignment ==
-                         0,
-                       "Encountered misaligned bloom filter block");
-        }
+    if (not host_copy_sources.empty()) { cudf::io::detail::synchronize_stream(stream, device); }
+    read_tasks.consume_all_indexed(
+      [&expected_read_sizes](std::size_t task_index, std::size_t bytes_read) {
+        CUDF_EXPECTS(bytes_read == expected_read_sizes[task_index],
+                     "Unexpected discrepancy in bloom filter bytes read.");
+      });
+  } catch (...) {
+    auto const primary_exception = std::current_exception();
+    try {
+      read_tasks.wait_all();
+    } catch (...) {
+      // Preserve the first scheduling, copy, or completion error after every
+      // issued datasource future has stopped accessing its destination.
+    }
+    if (not host_copy_sources.empty()) {
+      try {
+        cudf::io::detail::synchronize_stream(stream, device);
+      } catch (...) {
+        // synchronize_stream either establishes completion or terminates.
       }
-    });
-
-  // Read task sync function
-  for (auto& task : read_tasks) {
-    task.get();
+    }
+    std::rethrow_exception(primary_exception);
   }
 }
 
