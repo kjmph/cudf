@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -98,5 +98,5 @@ class CUDF_EXPORT hierarchical_thread_pool {
  *
  * @return Reference to the thread pool
  */
-hierarchical_thread_pool& host_worker_pool();
+CUDF_EXPORT hierarchical_thread_pool& host_worker_pool();
 }  // namespace cudf::detail
