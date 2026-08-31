@@ -98,5 +98,5 @@ class CUDF_EXPORT hierarchical_thread_pool {
  *
  * @return Reference to the thread pool
  */
-hierarchical_thread_pool& host_worker_pool();
+CUDF_EXPORT hierarchical_thread_pool& host_worker_pool();
 }  // namespace cudf::detail
