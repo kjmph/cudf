@@ -1,7 +1,9 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
+
+#include "io/utilities/future_drain_guard.hpp"
 
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/getenv_or.hpp>
@@ -24,9 +26,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <regex>
+#include <utility>
 #include <vector>
 
 #ifdef CUDF_KVIKIO_REMOTE_IO
@@ -312,7 +318,7 @@ class host_buffer_source final : public datasource {
  * when the wrapper object is destroyed.
  * All API calls are forwarded to the user datasource object.
  */
-class user_datasource_wrapper : public datasource {
+class user_datasource_wrapper : public datasource, public device_read_batch_source {
  public:
   explicit user_datasource_wrapper(datasource* const source) : source(source) {}
 
@@ -368,6 +374,12 @@ class user_datasource_wrapper : public datasource {
                                         rmm::cuda_stream_view stream) override
   {
     return source->device_read_async(offset, size, dst, stream);
+  }
+
+  std::future<std::vector<size_t>> device_read_batch_async(
+    cudf::host_span<device_read_request const> requests, rmm::cuda_stream_view stream) override
+  {
+    return cudf::io::device_read_batch_async(*source, requests, stream);
   }
 
   [[nodiscard]] size_t size() const override { return source->size(); }
@@ -511,6 +523,88 @@ std::future<size_t> datasource::host_read_async(size_t offset, size_t size, uint
 {
   return std::async(std::launch::deferred,
                     [this, offset, size, dst] { return host_read(offset, size, dst); });
+}
+
+std::future<std::vector<size_t>> device_read_batch_async(
+  datasource& source,
+  cudf::host_span<datasource::device_read_request const> requests,
+  rmm::cuda_stream_view stream)
+{
+  struct batch_state {
+    explicit batch_state(std::size_t size) : tasks{size}, results(size)
+    {
+      request_indices.reserve(size);
+    }
+
+    cudf::io::detail::future_drain_guard<size_t> tasks;
+    std::vector<size_t> results;
+    std::vector<size_t> request_indices;
+  };
+
+  std::vector<std::pair<std::uintptr_t, std::uintptr_t>> destination_ranges;
+  destination_ranges.reserve(requests.size());
+  for (auto const& request : requests) {
+    CUDF_EXPECTS(request.size == 0 or request.dst != nullptr,
+                 "A nonempty device read requires a non-null destination.");
+    CUDF_EXPECTS(request.size <= std::numeric_limits<size_t>::max() - request.offset,
+                 "Device read source range overflows.");
+    if (request.size != 0) {
+      auto const begin = reinterpret_cast<std::uintptr_t>(request.dst);
+      CUDF_EXPECTS(request.size <= std::numeric_limits<std::uintptr_t>::max() - begin,
+                   "Device read destination range overflows.");
+      destination_ranges.emplace_back(begin, begin + request.size);
+    }
+  }
+  std::sort(destination_ranges.begin(), destination_ranges.end());
+  for (std::size_t index = 1; index < destination_ranges.size(); ++index) {
+    CUDF_EXPECTS(destination_ranges[index].first >= destination_ranges[index - 1].second,
+                 "Device read destination ranges overlap.");
+  }
+
+  if (auto* batch_source = dynamic_cast<device_read_batch_source*>(&source);
+      batch_source != nullptr) {
+    return batch_source->device_read_batch_async(requests, stream);
+  }
+
+  // Allocate all fallback bookkeeping before issuing a read. The drain guard then owns every issued
+  // future until completion, including when scheduling or result consumption throws.
+  auto state      = std::make_shared<batch_state>(requests.size());
+  auto completion = std::async(std::launch::deferred, [state]() mutable {
+    std::exception_ptr completion_error;
+    try {
+      state->tasks.consume_all_indexed([&state](std::size_t index, std::size_t bytes_read) {
+        state->results[state->request_indices[index]] = bytes_read;
+      });
+    } catch (...) {
+      completion_error = std::current_exception();
+    }
+    if (completion_error != nullptr) { std::rethrow_exception(completion_error); }
+    return std::move(state->results);
+  });
+
+  try {
+    for (std::size_t request_index = 0; request_index < requests.size(); ++request_index) {
+      auto const& request = requests[request_index];
+      if (request.size == 0) {
+        state->results[request_index] = 0;
+      } else {
+        state->request_indices.push_back(request_index);
+        state->tasks.push(
+          source.device_read_async(request.offset, request.size, request.dst, stream));
+      }
+    }
+  } catch (...) {
+    auto const scheduling_error = std::current_exception();
+    try {
+      state->tasks.wait_all();
+    } catch (...) {
+      // The synchronous scheduling failure remains primary after every previously issued read has
+      // stopped accessing its destination.
+    }
+    std::rethrow_exception(scheduling_error);
+  }
+
+  return completion;
 }
 
 }  // namespace io

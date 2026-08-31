@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -14,6 +14,7 @@
 
 #include <future>
 #include <memory>
+#include <vector>
 
 namespace CUDF_EXPORT cudf {
 //! IO interfaces
@@ -83,6 +84,18 @@ class datasource {
     {
       return std::make_unique<owning_buffer<Container>>(std::forward<Container>(data_owner));
     }
+  };
+
+  /**
+   * @brief Describes one asynchronous device read in a datasource batch.
+   *
+   * A nonzero read requires a non-null destination. A zero-size read may use a null destination
+   * and completes with a byte count of zero. Destination ranges in the same batch must not overlap.
+   */
+  struct device_read_request {
+    size_t offset;  ///< Number of bytes from the start of the datasource
+    size_t size;    ///< Maximum number of bytes to read
+    uint8_t* dst;   ///< Address of the existing device memory
   };
 
   /**
@@ -414,6 +427,81 @@ class datasource {
     size_t _size;
   };
 };
+
+/**
+ * @brief Optional interface for datasources that implement native asynchronous device-read batches.
+ *
+ * Derive from both `datasource` and this interface to coalesce setup, storage reads, or device
+ * copies across a complete batch. Callers should use the free `device_read_batch_async` dispatcher,
+ * which discovers this interface and otherwise decomposes the batch into individual datasource
+ * reads.
+ */
+class device_read_batch_source {
+ public:
+  /**
+   * @brief Base class destructor.
+   */
+  virtual ~device_read_batch_source() = default;
+
+  /**
+   * @brief Asynchronously reads a batch of selected ranges into device buffers.
+   *
+   * The implementation must consume or copy every request descriptor before returning; the
+   * `requests` span does not remain valid after this call. The datasource and every destination
+   * must remain alive, and the destinations must not be accessed, until the returned future has
+   * completed. A ready future, including one that contains an exception, guarantees that no
+   * operation issued by this call continues to access a destination. A synchronous exception
+   * provides the same guarantee.
+   *
+   * Requests have been validated by the free dispatcher. A zero-size request must report zero
+   * bytes. Results must have the same size and order as the requests, and each result can be
+   * smaller than the corresponding requested size.
+   *
+   * A failure while scheduling the batch must be thrown synchronously, after the implementation
+   * has drained any work it already issued. Completion failures are reported by the returned
+   * future. Keeping these failure modes distinct allows a multi-source caller to drain earlier
+   * batches while preserving a later scheduling failure as the primary exception.
+   *
+   * @param requests Device read descriptors
+   * @param stream CUDA stream to use
+   * @return Number of bytes read for every request, in request order
+   */
+  virtual std::future<std::vector<size_t>> device_read_batch_async(
+    cudf::host_span<datasource::device_read_request const> requests,
+    rmm::cuda_stream_view stream) = 0;
+};
+
+/**
+ * @brief Asynchronously reads a batch of selected datasource ranges into device buffers.
+ *
+ * The complete batch is validated before any read is issued. If `source` implements
+ * `device_read_batch_source`, this function dispatches the complete batch to that interface.
+ * Otherwise, it delegates each nonempty request to `datasource::device_read_async` in request
+ * order. If scheduling an individual fallback read throws, this function drains every fallback
+ * read it already issued before rethrowing that scheduling exception synchronously. Completion
+ * failures are reported by the returned future after all reads have been drained.
+ *
+ * The datasource and every destination must remain alive, and the destinations must not be
+ * accessed, until the returned future has completed. A ready future, including one that contains an
+ * exception, guarantees that no operation issued by this call continues to access a destination. A
+ * synchronous exception provides the same guarantee.
+ *
+ * A nonempty request with a null destination is rejected synchronously before any read is
+ * scheduled. An empty request is valid, including one with a null destination, and reports zero
+ * bytes. An empty batch is also valid.
+ *
+ * @throws cudf::logic_error if a nonempty request has a null destination, a source or destination
+ * range overflows, or nonempty destination ranges overlap
+ *
+ * @param source Input datasource
+ * @param requests Device read descriptors
+ * @param stream CUDA stream to use
+ * @return Number of bytes read for every request, in request order
+ */
+std::future<std::vector<size_t>> device_read_batch_async(
+  datasource& source,
+  cudf::host_span<datasource::device_read_request const> requests,
+  rmm::cuda_stream_view stream);
 
 /**
  * @brief Constructs datasources from dataset source information

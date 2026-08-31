@@ -23,7 +23,6 @@
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/iterator>
-#include <cuda/std/tuple>
 
 #include <algorithm>
 #include <array>
@@ -198,7 +197,7 @@ using host_read_buffer = std::unique_ptr<cudf::io::datasource::buffer>;
   bool stream_fence_required,
   rmm::cuda_stream_view stream,
   int device,
-  cudf::io::detail::future_drain_guard<size_t>& device_read_tasks)
+  cudf::io::detail::future_drain_guard<std::vector<size_t>>& device_read_tasks)
 {
   try {
     device_read_tasks.wait_all();
@@ -220,7 +219,7 @@ using host_read_buffer = std::unique_ptr<cudf::io::datasource::buffer>;
 
 [[noreturn]] void finish_failed_device_schedule(
   std::exception_ptr primary_exception,
-  cudf::io::detail::future_drain_guard<size_t>& device_read_tasks)
+  cudf::io::detail::future_drain_guard<std::vector<size_t>>& device_read_tasks)
 {
   try {
     device_read_tasks.wait_all();
@@ -330,26 +329,20 @@ fetch_byte_ranges_to_device_async_impl(
                  io_source_indices.size() == io_offsets.size(),
                "Unexpected number of IO source indices, offsets, sizes, or destinations");
 
+  using device_read_request = cudf::io::datasource::device_read_request;
+  std::vector<bool> device_read_preferred;
+  device_read_preferred.reserve(io_offsets.size());
+  std::vector<size_t> device_read_counts(num_sources);
+  std::vector<std::vector<device_read_request>> device_read_batches(num_sources);
+  std::vector<size_t> device_batch_source_indices;
+  device_batch_source_indices.reserve(num_sources);
+  auto expected_device_read_sizes = std::make_shared<std::vector<std::vector<size_t>>>();
+  expected_device_read_sizes->reserve(num_sources);
+
   // Guards to drain every issued read before its source or destination can unwind.
-  auto device_read_tasks =
-    std::make_shared<cudf::io::detail::future_drain_guard<size_t>>(io_offsets.size());
-  auto expected_device_read_sizes = std::make_shared<std::vector<size_t>>();
-  expected_device_read_sizes->reserve(io_offsets.size());
   cudf::io::detail::future_drain_guard<host_read_buffer> host_read_tasks{io_offsets.size()};
   int device;
   CUDF_CUDA_TRY(cudf::io::detail::get_stream_device(stream, &device));
-
-  // Construct the returned completion state before any device read is issued. A failure to allocate
-  // that state therefore cannot strand an issued read. The shared guard also drains reads if the
-  // returned deferred future is discarded without being consumed.
-  auto read_completion =
-    std::async(std::launch::deferred, [device_read_tasks, expected_device_read_sizes] {
-      device_read_tasks->consume_all_indexed(
-        [&expected_device_read_sizes](std::size_t task_index, std::size_t bytes_read) {
-          CUDF_EXPECTS(bytes_read == (*expected_device_read_sizes)[task_index],
-                       "Unexpected discrepancy in bytes read.");
-        });
-    });
 
   // Vectors to store intermediate host buffers and relevant pointers
   std::vector<host_read_buffer> host_buffers{};
@@ -359,32 +352,80 @@ fetch_byte_ranges_to_device_async_impl(
   copy_dsts.reserve(io_offsets.size());
   copy_sizes.reserve(io_offsets.size());
 
-  auto iter = cuda::make_zip_iterator(
-    io_source_indices.begin(), io_offsets.begin(), io_sizes.begin(), destinations.begin());
-
-  // Schedule host reads holding the `host_read_mutex` so that all reads for a caller thread
-  // are scheduled without interleaving with reads from other threads yielding better pipelining
+  // Evaluate each preference exactly once and schedule host reads while holding the existing host
+  // serialization lock. This keeps one caller's preference decisions and host scheduling from
+  // interleaving with another caller, while avoiding the old second, potentially inconsistent
+  // preference evaluation during device scheduling.
   {
     std::scoped_lock<std::mutex> lock(host_read_mutex);
 
-    std::for_each(iter, iter + io_offsets.size(), [&](auto const& tuple) {
-      auto const src_idx   = cuda::std::get<0>(tuple);
-      auto const io_offset = cuda::std::get<1>(tuple);
-      auto const io_size   = cuda::std::get<2>(tuple);
-      auto const dest      = cuda::std::get<3>(tuple);
+    for (std::size_t io_index = 0; io_index < io_offsets.size(); ++io_index) {
+      auto const source_index = io_source_indices[io_index];
+      auto const preferred =
+        datasources[source_index].get().is_device_read_preferred(io_sizes[io_index]);
+      device_read_preferred.push_back(preferred);
+      if (preferred) { ++device_read_counts[source_index]; }
+    }
 
-      auto& datasource = datasources[src_idx].get();
-      if (not datasource.is_device_read_preferred(io_size)) {
+    // Complete all grouping allocations before a datasource can start accessing a destination.
+    for (std::size_t source_index = 0; source_index < num_sources; ++source_index) {
+      device_read_batches[source_index].reserve(device_read_counts[source_index]);
+    }
+    for (std::size_t io_index = 0; io_index < io_offsets.size(); ++io_index) {
+      if (device_read_preferred[io_index]) {
+        device_read_batches[io_source_indices[io_index]].push_back(
+          {io_offsets[io_index], io_sizes[io_index], destinations[io_index]});
+      }
+    }
+    for (std::size_t source_index = 0; source_index < num_sources; ++source_index) {
+      auto const& batch = device_read_batches[source_index];
+      if (batch.empty()) { continue; }
+      device_batch_source_indices.push_back(source_index);
+      auto& expected_sizes = expected_device_read_sizes->emplace_back();
+      expected_sizes.reserve(batch.size());
+      std::transform(
+        batch.begin(), batch.end(), std::back_inserter(expected_sizes), [](auto const& r) {
+          return r.size;
+        });
+    }
+
+    for (std::size_t io_index = 0; io_index < io_offsets.size(); ++io_index) {
+      if (not device_read_preferred[io_index]) {
+        auto& datasource       = datasources[io_source_indices[io_index]].get();
+        auto const io_offset   = io_offsets[io_index];
+        auto const io_size     = io_sizes[io_index];
+        auto const destination = destinations[io_index];
         // Asynchronously read column chunk data to a host buffer
         host_read_tasks.push(cudf::detail::host_worker_pool().submit_task(
           [&datasource, io_offset, io_size]() -> host_read_buffer {
             return datasource.host_read(io_offset, io_size);
           }));
-        copy_dsts.push_back(static_cast<void*>(dest));
+        copy_dsts.push_back(static_cast<void*>(destination));
         copy_sizes.push_back(io_size);
       }
-    });
+    }
   }
+
+  auto device_read_tasks =
+    std::make_shared<cudf::io::detail::future_drain_guard<std::vector<size_t>>>(
+      device_batch_source_indices.size());
+
+  // Construct the returned completion state before any device read is issued. A failure to allocate
+  // that state therefore cannot strand an issued read. The shared guard also drains reads if the
+  // returned deferred future is discarded without being consumed.
+  auto read_completion =
+    std::async(std::launch::deferred, [device_read_tasks, expected_device_read_sizes] {
+      device_read_tasks->consume_all_indexed(
+        [&expected_device_read_sizes](std::size_t task_index, std::vector<size_t> bytes_read) {
+          auto const& expected_sizes = (*expected_device_read_sizes)[task_index];
+          CUDF_EXPECTS(bytes_read.size() == expected_sizes.size(),
+                       "Unexpected number of device reads completed.");
+          for (std::size_t request_index = 0; request_index < bytes_read.size(); ++request_index) {
+            CUDF_EXPECTS(bytes_read[request_index] == expected_sizes[request_index],
+                         "Unexpected discrepancy in bytes read.");
+          }
+        });
+    });
 
   // Complete host reads
   if (not host_read_tasks.empty()) {
@@ -400,7 +441,7 @@ fetch_byte_ranges_to_device_async_impl(
     });
   }
 
-  // `device_read_async` is not guaranteed to follow stream-ordering (see datasource API docs)
+  // Datasource device reads are not guaranteed to follow stream-ordering (see datasource API docs)
   cudf::io::detail::synchronize_stream(stream, device);
 
   std::exception_ptr device_schedule_error;
@@ -412,19 +453,14 @@ fetch_byte_ranges_to_device_async_impl(
     std::scoped_lock<std::mutex> lock(device_read_mutex);
 
     try {
-      std::for_each(iter, iter + io_offsets.size(), [&](auto const& tuple) {
-        auto const src_idx   = cuda::std::get<0>(tuple);
-        auto const io_offset = cuda::std::get<1>(tuple);
-        auto const io_size   = cuda::std::get<2>(tuple);
-        auto const dest      = cuda::std::get<3>(tuple);
-
-        auto& datasource = datasources[src_idx].get();
-        // Directly read the column chunk data to the device buffer if supported
-        if (datasource.is_device_read_preferred(io_size)) {
-          expected_device_read_sizes->push_back(io_size);
-          device_read_tasks->push(datasource.device_read_async(io_offset, io_size, dest, stream));
-        }
-      });
+      for (auto const source_index : device_batch_source_indices) {
+        auto& datasource  = datasources[source_index].get();
+        auto const& batch = device_read_batches[source_index];
+        device_read_tasks->push(cudf::io::device_read_batch_async(
+          datasource,
+          cudf::host_span<device_read_request const>{batch.data(), batch.size()},
+          stream));
+      }
     } catch (...) {
       device_schedule_error = std::current_exception();
     }
