@@ -1,0 +1,66 @@
+Research fork handoff validation
+UTC: 2026-10-30T14:54:48.101469+00:00
+Host: Linux-7.0.14-linuxkit-aarch64-with-glibc2.41
+Fresh Release build from kjmph_cudf; LLVM/MLIR 21.1.8, Arrow 21.0.0, GCC 14.2.
+GPU disabled; GPU adapter and runtime tests remain unbuilt/unrun.
+Meld full lit results in meld-regressions-2026-10-27.txt are historical, not rerun here.
+kjmph_cudf: branch=research/meld, base=aa9e3983a1a1ae78a45e5555109939a6111f2bb7; staged POC changes required.
+meld: branch=kjmph/research/cudf, base=0bcb442bd37dd1a4dd5bc0a17d39d7249f8d5d0e; staged POC changes required.
+
+$ /tmp/jit-poc-sdk/bin/ctest --test-dir /tmp/jit-research-build --output-on-failure --timeout 60
+Test project /tmp/jit-research-build
+    Start 1: lazy_plan_test
+1/6 Test #1: lazy_plan_test ...................   Passed    0.00 sec
+    Start 2: graph_plan_test
+2/6 Test #2: graph_plan_test ..................   Passed    0.00 sec
+    Start 3: lazy_compiler_test
+3/6 Test #3: lazy_compiler_test ...............   Passed    0.08 sec
+    Start 4: lazy_cpu_test
+4/6 Test #4: lazy_cpu_test ....................   Passed    0.05 sec
+    Start 5: graph_cpu_test
+5/6 Test #5: graph_cpu_test ...................   Passed    0.08 sec
+    Start 6: date_test
+6/6 Test #6: date_test ........................   Passed    0.06 sec
+
+100% tests passed out of 6
+
+Total Test time (real) =   0.28 sec
+
+exit_code=0
+
+$ /tmp/jit-poc-sdk/bin/python /Users/khubert/projects/jit/kjmph_cudf/cpp/examples/lazy_meld/tests/validate_q6_duckdb.py /tmp/jit-research-build/q6_demo --scale 0.01 --work-dir /tmp/jit-q6-fork-validation
+target=cpu selection=automatic (capability rules; no cost model)
+fragment 0 [meld]: filter -> project -> sum(expression)
+  Fuse row expressions into scalar SUM; no filter/project columns; materialize aggregate result.
+cold_compile_ms=15.372958
+query=full_q6
+execution_target=cpu
+shipdate_type=date32
+shipdate_range=[1994-01-01,1995-01-01)
+discount_range=[0.05,0.07]
+quantity_lt=24
+dataset=lineitem.tbl
+rows=60175
+iterations=20
+result=1193053.2253
+reference_result=1193053.2253
+warm_median_ms=0.080479
+correctness=PASS
+{
+  "duckdb_version": "2.0.0",
+  "generator": "DuckDB tpch/dbgen",
+  "scale_factor": 0.01,
+  "rows": 60175,
+  "duckdb_decimal_revenue": "1193053.2253",
+  "meld_float64_revenue": "1193053.2253",
+  "comparison": "rel_tol=1e-10, abs_tol=1e-8",
+  "correctness": "PASS",
+  "query": "SELECT sum(l_extendedprice*l_discount) FROM lineitem\nWHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01'\nAND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24",
+  "command": [
+    "/tmp/jit-research-build/q6_demo",
+    "--lineitem",
+    "/tmp/jit-q6-fork-validation/lineitem.tbl"
+  ]
+}
+
+exit_code=0

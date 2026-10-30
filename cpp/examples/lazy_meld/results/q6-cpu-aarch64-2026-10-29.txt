@@ -1,0 +1,110 @@
+Full Q6 / typed DATE32 validation
+Recorded UTC: 2026-10-29T19:13:10.536269+00:00
+Host: Linux-7.0.14-linuxkit-aarch64-with-glibc2.41
+Compiler: c++ (Debian 14.2.0-19) 14.2.0
+SDK: LLVM/MLIR 21.1.8, Arrow 21.0.0; release build, GPU disabled.
+One CPU thread per query execution; three warmups, twenty measured iterations.
+Cold compilation separate; data generation/loading outside execution timing.
+FLOAT64 numeric columns, DATE32 shipping date; not decimal-exact or an official TPC-H benchmark.
+GPU runtime/adapter remains unbuilt and unrun. PTX compilation is covered by lazy_compiler_test.
+cudf base: b3378b6246e77ab8c6a2716606becc82b1446383; local POC modifications required.
+meld base: 0bcb442bd37dd1a4dd5bc0a17d39d7249f8d5d0e; local POC modifications required.
+
+$ /tmp/jit-poc-sdk/bin/ctest --test-dir /tmp/jit-poc-build --output-on-failure --timeout 60
+Test project /tmp/jit-poc-build
+    Start 1: lazy_plan_test
+1/6 Test #1: lazy_plan_test ...................   Passed    0.00 sec
+    Start 2: graph_plan_test
+2/6 Test #2: graph_plan_test ..................   Passed    0.00 sec
+    Start 3: lazy_compiler_test
+3/6 Test #3: lazy_compiler_test ...............   Passed    0.07 sec
+    Start 4: lazy_cpu_test
+4/6 Test #4: lazy_cpu_test ....................   Passed    0.05 sec
+    Start 5: graph_cpu_test
+5/6 Test #5: graph_cpu_test ...................   Passed    0.08 sec
+    Start 6: date_test
+6/6 Test #6: date_test ........................   Passed    0.06 sec
+
+100% tests passed out of 6
+
+Total Test time (real) =   0.27 sec
+
+exit_code=0
+
+$ /tmp/jit-poc-sdk/bin/ctest --test-dir /tmp/cudf-q6-frontend --output-on-failure --timeout 60
+Test project /tmp/cudf-q6-frontend
+    Start 1: lazy_plan_test
+1/2 Test #1: lazy_plan_test ...................   Passed    0.00 sec
+    Start 2: graph_plan_test
+2/2 Test #2: graph_plan_test ..................   Passed    0.00 sec
+
+100% tests passed out of 2
+
+Total Test time (real) =   0.00 sec
+
+exit_code=0
+
+$ /tmp/jit-poc-build/date_test
+DATE32/full Q6=PASS (golden revenue=37; exact boundaries, null dates, signed day counts, typed materialization/grouping, sliced masks, async)
+
+exit_code=0
+
+$ /tmp/jit-poc-sdk/bin/python /Users/khubert/projects/jit/cudf/cpp/examples/lazy_meld/tests/validate_q6_duckdb.py /tmp/jit-poc-build/q6_demo --scale 0.01 --work-dir /tmp/jit-q6-validation
+target=cpu selection=automatic (capability rules; no cost model)
+fragment 0 [meld]: filter -> project -> sum(expression)
+  Fuse row expressions into scalar SUM; no filter/project columns; materialize aggregate result.
+cold_compile_ms=12.028584
+query=full_q6
+execution_target=cpu
+shipdate_type=date32
+shipdate_range=[1994-01-01,1995-01-01)
+discount_range=[0.05,0.07]
+quantity_lt=24
+dataset=lineitem.tbl
+rows=60175
+iterations=20
+result=1193053.2253
+reference_result=1193053.2253
+warm_median_ms=0.0774165
+correctness=PASS
+{
+  "duckdb_version": "2.0.0",
+  "generator": "DuckDB tpch/dbgen",
+  "scale_factor": 0.01,
+  "rows": 60175,
+  "duckdb_decimal_revenue": "1193053.2253",
+  "meld_float64_revenue": "1193053.2253",
+  "comparison": "rel_tol=1e-10, abs_tol=1e-8",
+  "correctness": "PASS",
+  "query": "SELECT sum(l_extendedprice*l_discount) FROM lineitem\nWHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01'\nAND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24",
+  "command": [
+    "/tmp/jit-poc-build/q6_demo",
+    "--lineitem",
+    "/tmp/jit-q6-validation/lineitem.tbl"
+  ]
+}
+
+exit_code=0
+
+$ /tmp/jit-poc-build/lazy_cpu_test --benchmark 1000000 20
+cold_meld_cpu_compile_ms=13.55175
+cpu_correctness=PASS (full Q6, date boundaries, nulls, empty, NaN/Inf, slices, reuse, async, typed schema)
+query=full_q6
+shipdate_type=date32
+dataset=synthetic
+execution_target=cpu
+cpu_threads_per_execution=1
+rows=1000000
+iterations=20
+nullable=false
+result=329896.07
+reference_result=329896.07
+warm_meld_cpu_median_ms=1.065125
+warm_meld_cpu_submit_wait_median_ms=1.102292
+nullable=true
+result=252350.535
+reference_result=252350.535
+warm_meld_cpu_median_ms=1.210708
+warm_meld_cpu_submit_wait_median_ms=1.203875
+
+exit_code=0

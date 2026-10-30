@@ -1,0 +1,56 @@
+Experimental cuDF graph API, 2026-10-28
+Linux aarch64; Release GCC 14.2; LLVM/MLIR 21.1.8; Arrow 21.0.0.
+Synthetic FLOAT64 grouping workload, not TPC-H. CPU execution only, one thread per run.
+GPU plan printed for inspection; GPU adapter unbuilt/unrun.
+Data generation excluded. Compile timing includes the graph's two Meld regions, excludes
+process startup and plan construction. Three warmups; median of 20 synchronous executions.
+No affinity pinning; no speedup claim. Intermediate bytes are logical buffers between fragments,
+not peak allocation: hash-table capacity and reference-internal buffers are excluded.
+Command: /tmp/jit-poc-build/graph_demo 100000
+
+target=cpu selection=automatic (capability rules; no cost model)
+fragment 0 [meld]: filter -> group_by(expressions).sum(expression)
+  Fuse filters, keys and measure into Meld hash aggregation; no per-input-row key columns; materialize group results.
+fragment 1 [host_reference]: stable_sort
+  Stable ordering requires all rows; materialize the sorted output.
+fragment 2 [meld]: sum(expression)
+  Fuse row expressions into scalar SUM; no filter/project columns; materialize aggregate result.
+
+GPU proposal (planning only):
+target=gpu selection=automatic (capability rules; no cost model)
+fragment 0 [cudf]: filter
+  Materialize operator output; this GPU Meld adapter requires a terminal scalar SUM.
+fragment 1 [cudf]: group_by(expressions).sum(expression)
+  Materialize key/measure expressions for cuDF groupby; inline device-expression hook not implemented.
+fragment 2 [cudf]: stable_sort
+  Stable ordering requires all rows; materialize the sorted output.
+fragment 3 [meld]: sum(expression)
+  Fuse row expressions into scalar SUM; no filter/project columns; materialize aggregate result.
+cold_compile_ms=21.6052
+execution_target=cpu
+rows=100000
+iterations=20
+result=5.838e+06
+reference_result=5.838e+06
+meld_fragments=2
+host_reference_fragments=1
+intermediate_logical_bytes=976
+warm_median_ms=1.35783
+correctness=PASS
+
+Validation:
+Test project /tmp/jit-poc-build
+    Start 1: lazy_plan_test
+1/5 Test #1: lazy_plan_test ...................   Passed    0.00 sec
+    Start 2: graph_plan_test
+2/5 Test #2: graph_plan_test ..................   Passed    0.00 sec
+    Start 3: lazy_compiler_test
+3/5 Test #3: lazy_compiler_test ...............   Passed    0.07 sec
+    Start 4: lazy_cpu_test
+4/5 Test #4: lazy_cpu_test ....................   Passed    0.06 sec
+    Start 5: graph_cpu_test
+5/5 Test #5: graph_cpu_test ...................   Passed    0.10 sec
+
+100% tests passed out of 5
+
+Total Test time (real) =   0.24 sec

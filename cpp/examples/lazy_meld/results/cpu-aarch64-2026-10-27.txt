@@ -1,0 +1,38 @@
+Native CPU execution of the lazy cuDF API prototype through Meld
+Recorded: 2026-10-27 UTC
+
+Command:
+  /tmp/jit-poc-build/lazy_cpu_test --benchmark 1000000 20
+
+Environment:
+  Linux aarch64 development container; CPU vendor reported as Apple
+  One CPU thread per execution; no CPU affinity pinning
+  Release build, GCC 14.2.0, LLVM/MLIR 21.1.8, Arrow 21.0.0
+  No libcudf, CUDA runtime/driver, or RMM shared-library dependency (checked with ldd)
+
+Method:
+  Same Q6 graph, input generator, and CPU reference shared with the GPU test
+  1,000,000 rows, three FLOAT64 columns; synthetic data, not the full TPC-H Q6 query
+  Data generation and validity packing excluded from timing
+  Cold compile timer covers Meld compilation/lookup; it excludes process startup and graph creation
+  Warm timings: median of 20 iterations after 3 warmups, validated after every iteration
+  run() executes on the caller thread; submit().get() includes a new std::async worker and its wait
+  No GPU timing or CPU-versus-GPU speedup is implied
+
+Raw executable output:
+cold_meld_cpu_compile_ms=16.11575
+cpu_correctness=PASS (nulls, empty, NaN/Inf, slices, reuse, async, schema)
+execution_target=cpu
+cpu_threads_per_execution=1
+rows=1000000
+iterations=20
+nullable=false
+result=989839.835
+reference_result=989839.835
+warm_meld_cpu_median_ms=1.193375
+warm_meld_cpu_submit_wait_median_ms=1.199584
+nullable=true
+result=815204.9825
+reference_result=815204.9825
+warm_meld_cpu_median_ms=1.390542
+warm_meld_cpu_submit_wait_median_ms=1.558292
